@@ -68,7 +68,7 @@ def semantic_boundary_weight(seg_mask):
     return cv2.GaussianBlur(beta.astype(np.float32), (17, 17), 0)
 
 
-def load_mlp_fusion_model(ckpt_path):
+def load_mlp_fusion_model(ckpt_path, feature_channels=256, hidden_channels=(256, 128, 64)):
     if not ckpt_path:
         raise ValueError("MLP fusion requires --fusion_mlp_ckpt or mask_fusion.mlp_ckpt in config.")
     ckpt_path = resolve_repo_path(ckpt_path, PROJECT_ROOT, fix_model_dir=True)
@@ -85,8 +85,8 @@ def load_mlp_fusion_model(ckpt_path):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     state = torch.load(ckpt_path, map_location=device)
     model = MaskFusionMLP(
-        in_channels=state.get("input_channels", 4),
-        hidden_channels=state.get("hidden_channels", 16),
+        feature_channels=state.get("feature_channels", feature_channels),
+        hidden_channels=tuple(state.get("hidden_channels", hidden_channels)),
     )
     model.load_state_dict(state["model"] if "model" in state else state)
     model.to(device)
@@ -165,8 +165,12 @@ def stage_realistic(cfg, sample_dir, base_name, input_image, batch=False, overwr
     else:
         args = f"--input {q(input_image)} --output {q(output_image)}"
     realistic_cfg = cfg.get("realistic_generation", {})
-    if realistic_cfg.get("prompt"):
-        args += f" --prompt {q(realistic_cfg['prompt'])}"
+    args += (
+        f" --vision_language_model {q(realistic_cfg.get('vision_language_model', 'qwen-vl-max'))}"
+        f" --image_edit_model {q(realistic_cfg.get('image_edit_model', 'qwen-image-edit-plus'))}"
+        f" --lexicon_path {q(resolve_repo_path(realistic_cfg['lexicon_path']))}"
+        f" --fixed_suffix {q(realistic_cfg.get('fixed_suffix', 'realistic photograph'))}"
+    )
     run_python_script(cfg["paths"]["realistic_generation"], args)
     return output_image
 
@@ -175,7 +179,13 @@ def stage_lisa(cfg, sample_dir, base_name, realistic_image):
     print("🎭 [Stage 2] LISA Segmentation")
     lisa_script = cfg["paths"]["lisa_segmentation"]
     output_mask = os.path.join(sample_dir, f"{base_name}_realistic_mask.jpg")
-    run_python_script(lisa_script, f"--input {q(realistic_image)} --output {q(output_mask)}")
+    output_features = os.path.join(sample_dir, f"{base_name}_realistic_features.npy")
+    lisa_cfg = cfg.get("lisa", {})
+    run_python_script(
+        lisa_script,
+        f"--input {q(realistic_image)} --output {q(output_mask)} "
+        f"--feature_output {q(output_features)} --version {q(lisa_cfg['version'])}",
+    )
     return output_mask
 
 
@@ -207,6 +217,7 @@ def stage_dinov3(cfg, sample_dir, base_name, input_image):
         f"--input_h {input_h} "
         f"--input_w {input_w} "
         f"--thr {thr}"
+        f" --dino_size {q(cfg['dinov3'].get('backbone', 'l'))}"
     )
 
     # 调用 DINOv3 模块
@@ -217,9 +228,20 @@ def stage_dinov3(cfg, sample_dir, base_name, input_image):
     return seg_mask_path
 
 
-def stage_fuse(sample_dir, base_name, lisa_mask, dinov3_mask, semantic_mask_path,
-               fusion_mlp_ckpt, fusion_threshold=0.5):
-    """Fuse LISA and DINOv3 masks using the trained per-pixel MLP."""
+def _load_feature_tensor(path, name):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing {name} feature tensor: {path}")
+    feature = np.load(path).astype(np.float32)
+    if feature.ndim == 2:
+        feature = feature[None, ...]
+    if feature.ndim != 3:
+        raise ValueError(f"{name} feature tensor must have shape [C, H, W], got {feature.shape}")
+    return feature[None, ...]
+
+
+def stage_fuse(sample_dir, base_name, lisa_mask, dinov3_mask, fusion_mlp_ckpt,
+               fusion_threshold=0.5, feature_channels=256, hidden_channels=(256, 128, 64)):
+    """Fuse M_anc, F_anc, M_real, and F_real with the MGB feature MLP."""
     print("🔗 [Stage 4] MLP Mask Fusion")
 
     # ===== 读取输入掩码 =====
@@ -233,31 +255,24 @@ def stage_fuse(sample_dir, base_name, lisa_mask, dinov3_mask, semantic_mask_path
     if m1.shape != m2.shape:
         m1 = cv2.resize(m1, (m2.shape[1], m2.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-    # ===== 读取语义图 (npy 文件) =====
-    if semantic_mask_path is None:
-        semantic = np.ones_like(m2, dtype=np.float32)
-    elif isinstance(semantic_mask_path, str):
-        if not os.path.exists(semantic_mask_path):
-            raise FileNotFoundError(f"❌ 未找到语义文件: {semantic_mask_path}")
-        semantic = np.load(semantic_mask_path).astype(np.float32)
-    else:
-        semantic = semantic_mask_path.astype(np.float32)  # 直接传 numpy 数组
-
-    # 归一化到 [0,1]
-    semantic = np.clip(semantic, 0, 1)
-    if semantic.ndim == 3:
-        semantic = np.mean(semantic, axis=-1)  # 若为多通道则取平均
-
-    if semantic.shape != m2.shape:
-        semantic = cv2.resize(semantic, (m2.shape[1], m2.shape[0]), interpolation=cv2.INTER_LINEAR)
-
     import torch
 
-    model, device = load_mlp_fusion_model(fusion_mlp_ckpt)
-    boundary = semantic_boundary_weight(m2) * semantic
-    x = np.stack([m1, m2, semantic, boundary], axis=0)[None, ...].astype(np.float32)
+    model, device = load_mlp_fusion_model(
+        fusion_mlp_ckpt, feature_channels=feature_channels, hidden_channels=hidden_channels
+    )
+    anc_feature_path = os.path.join(sample_dir, f"{base_name}_anc_features.npy")
+    real_feature_path = os.path.join(sample_dir, f"{base_name}_realistic_features.npy")
+    f_anc = _load_feature_tensor(anc_feature_path, "Ancient Painting Stream")
+    f_real = _load_feature_tensor(real_feature_path, "Realistic Image Stream")
+    m_anc = m2[None, None, ...].astype(np.float32)
+    m_real = m1[None, None, ...].astype(np.float32)
     with torch.no_grad():
-        logits = model(torch.from_numpy(x).to(device))
+        logits = model(
+            torch.from_numpy(m_anc).to(device),
+            torch.from_numpy(f_anc).to(device),
+            torch.from_numpy(m_real).to(device),
+            torch.from_numpy(f_real).to(device),
+        )
         fused = torch.sigmoid(logits)[0, 0].detach().cpu().numpy()
 
     # ===== 二值化输出 =====
@@ -481,14 +496,13 @@ def main():
 
     # Step 4
     if args.stage in ["fuse", "all"]:
-        # 读取语义图；缺失时 stage_fuse 会使用全 1 特征图。
-        semantic_mask_path = os.path.join(sample_dir, f"{base_name}_Sx.npy")
-        semantic_mask = np.load(semantic_mask_path) if os.path.exists(semantic_mask_path) else None
         fusion_cfg = cfg.get("mask_fusion", {})
         fused_mask = stage_fuse(
-            sample_dir, base_name, lisa_mask, dinov3_mask, semantic_mask,
+            sample_dir, base_name, lisa_mask, dinov3_mask,
             fusion_mlp_ckpt=args.fusion_mlp_ckpt or fusion_cfg.get("mlp_ckpt"),
             fusion_threshold=fusion_cfg.get("threshold", 0.5),
+            feature_channels=fusion_cfg.get("feature_channels", 256),
+            hidden_channels=tuple(fusion_cfg.get("hidden_channels", [256, 128, 64])),
         )
 
     # Step 5

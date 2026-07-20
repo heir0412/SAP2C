@@ -1,70 +1,48 @@
-# Cinemagraph
+# SAP2C
 
-GitHub-ready inference code and paired segmentation dataset for the Cinemagraph project.
+Source-code implementation for **SAP2C: Automated Eulerian Cinemagraph
+Synthesis from a Single Ancient Painting**.
 
-## Repository layout
+## Pipeline
+
+1. **Image Transfer Block (ITB).** Qwen-VL-Max extracts a scene description
+   from the input painting. A deterministic artistic-vocabulary lexicon removes
+   style descriptors, and Qwen-Image-Edit-Plus uses the processed prompt to
+   generate a photorealistic semantic proxy.
+2. **Mask Generation Block (MGB).** DINOv3-Large (ViT-L/16) provides
+   structural features from the ancient painting, while LISA-13B provides
+   realistic-domain semantic features. A pixel-wise MLP fuses
+   `[M_anc, F_anc, M_real, F_real]` through hidden layers of 256, 128, and 64
+   units.
+3. **Cinemagraph Generation Block (CGB).** Semantic-Aware Flow Refinement
+   (SAFR) smooths motion within semantic regions. Semantic-Gated Feature
+   Splatting (SGFS) bidirectionally aggregates warped features using
+   semantic-consistency kernels.
+
+## Important files
 
 ```text
-cinemagraph_github/
-├── config/                 # Runtime configuration
-├── data/                   # Data loaders used by the pipeline
-├── dataset/
-│   ├── train/
-│   │   ├── image/          # 1,600 images
-│   │   └── mask/           # 1,600 paired masks
-│   ├── validation/
-│   │   ├── image/          # 400 images
-│   │   └── mask/           # 400 paired masks
-│   └── test/
-│       ├── image/          # 207 images
-│       └── mask/           # 207 paired masks
-├── img2img/                # Image-to-image inference code
-├── model/
-│   ├── dinov3/             # DINOv3-based segmentation module
-│   ├── LISA/
-│   ├── mask_fusion/
-│   └── realistic_generation/
-├── options/
-├── util/
-└── main.py
+config/config.yaml                         Runtime configuration
+main.py                                    Pipeline entry point
+model/realistic_generation/generation.py  Qwen-VL-Max and Qwen-Image-Edit-Plus proxy construction
+model/realistic_generation/artistic_lexicon.json  Deterministic style-mapping lexicon
+model/dinov3/                              Ancient Painting Stream
+model/LISA/                                Realistic Image Stream
+model/mask_fusion/mlp_fusion.py            Four-input feature-fusion MLP
+video_inference.py                         SAFR and SGFS video synthesis
 ```
 
-The train/validation split is deterministic (`seed=42`) and was generated only from the original `model/segdino/dataset/train` image and `orange_mask` pairs. The 207-pair test set is copied from the original validation images and `orange_mask` masks. The old `mask`/`color_mask` directories are not used.
+## Configuration
 
-## Mask fusion
-
-The fuse stage uses only the trained per-pixel MLP in `model/mask_fusion/mlp_fusion.py`. Its four inputs are the LISA mask, DINOv3 mask, semantic map, and semantic boundary map. Configure the checkpoint and output threshold under `mask_fusion` in `config/config.yaml`.
-
-## Excluded content
-
-Model weights/checkpoints, API keys, caches, generated results, training code, and one-off experiment/evaluation scripts are intentionally excluded. Download required model weights separately and update `config/config.yaml` with local paths.
-
-Set the DashScope key through the environment; never commit it:
+Set `DASHSCOPE_API_KEY` in your environment before invoking the image-transfer
+stage. Configure local paths for the DINOv3-Large, LISA-13B, and MGB
+checkpoints in `config/config.yaml`. The proxy-construction stage records the
+intermediate `p_anc` and `p_real` prompts next to each generated proxy image.
 
 ```bash
-cp .env.example .env
 export DASHSCOPE_API_KEY="your-key"
-```
-
-## Dataset storage
-
-The dataset is configured for Git LFS. Before committing it, install and initialize Git LFS:
-
-```bash
-git lfs install
-git add .gitattributes dataset
-```
-
-## Run
-
-Install the common inference dependencies first:
-
-```bash
-pip install -r requirements.txt
-```
-
-LISA and DINOv3 may require the additional dependencies listed in their own `requirements.txt` files. Review the local model paths in `config/config.yaml`, then run:
-
-```bash
 python main.py --help
 ```
+
+The source code is publicly available at
+<https://github.com/heir0412/SAP2C>.

@@ -16,24 +16,28 @@ paths:
   motion_generation: "./"
   video_generation: "./video_inference.py"
   # DINOv3 模型文件
-  ckpt: "./model/dinov3/runs/dinov3_s_512/ckpts/best_ep018_dice0.7799.pth"
-  dino_ckpt: "./model/dinov3/web_pth/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+  ckpt: "./model/dinov3/runs/dinov3_l_512/ckpts/best_ep018_dice0.7799.pth"
+  dino_ckpt: "./model/dinov3/web_pth/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
   repo_dir: "./model/dinov3/dinov3"
   tokenizer_path: "./openai/clip-vit-large-patch14"
 
 # ========== Realistic Generation ==========
 realistic_generation:
-  prompt: "realistic photograph."
+  vision_language_model: "qwen-vl-max"
+  image_edit_model: "qwen-image-edit-plus"
+  lexicon_path: "model/realistic_generation/artistic_lexicon.json"
+  fixed_suffix: "realistic photograph"
 
 # ========== LISA Segmentation ==========
 lisa:
-  version: "./model/LISA/LISA-7B-v1"
+  version: "./model/LISA/LISA-13B-v1"
   precision: "bf16"
   focus_text: "Segment all water regions in the image, including rivers, oceans, and lakes."
   vis_save_path: "./samples/00001/"
 
 # ========== DINOv3 分割参数 ==========
 dinov3:
+  backbone: "l"
   input_size: [512, 512]
   dice_thr: 0.5
 
@@ -41,6 +45,10 @@ dinov3:
 mask_fusion:
   mlp_ckpt: "./model/mask_fusion/runs/bce_dice/best_mlp_fusion.pth"
   threshold: 0.5
+  feature_channels: 256
+  hidden_channels: [256, 128, 64]
+  lambda_bce: 1.0
+  lambda_dice: 1.0
 
 # ========== Motion 光流生成 ==========
 optical_flow:

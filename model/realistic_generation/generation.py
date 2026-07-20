@@ -1,214 +1,225 @@
-import os
+"""MLLM-guided construction of a photorealistic semantic proxy.
+
+The pipeline follows the manuscript: Qwen-VL-Max first describes the input
+painting, a deterministic lexicon removes painting-style expressions, and
+Qwen-Image-Edit-Plus edits the original image using the resulting prompt.
+"""
+
 import argparse
 import base64
+import json
 import mimetypes
-import requests
+import os
+import re
+from pathlib import Path
+
 import cv2
-from dashscope import MultiModalConversation
 import dashscope
+import numpy as np
+import requests
+from dashscope import MultiModalConversation
 
-# ==================== Dashscope API 基础配置 ====================
-dashscope.base_http_api_url = 'https://dashscope.aliyuncs.com/api/v1'
+dashscope.base_http_api_url = "https://dashscope.aliyuncs.com/api/v1"
+
+DEFAULT_PARSE_INSTRUCTION = (
+    "Describe this Chinese landscape painting for image editing. Identify the "
+    "main objects, water or other fluid regions, surrounding elements, spatial "
+    "relationships, and composition. Preserve observable content, but do not "
+    "invent objects. Return one concise scene description."
+)
+DEFAULT_LEXICON = {
+    "ink wash": "",
+    "ink-and-wash": "",
+    "brushwork": "",
+    "brush strokes": "",
+    "traditional Chinese painting": "",
+    "Chinese painting": "",
+    "landscape painting": "landscape",
+    "xuan paper": "",
+    "rice paper": "",
+    "calligraphic": "",
+    "freehand": "",
+    "literati": "",
+}
 
 
-# --- 从环境变量读取 API 密钥 ---
 def read_api_key():
-    """Read the DashScope API key from DASHSCOPE_API_KEY."""
     key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
     if not key:
         raise ValueError("DASHSCOPE_API_KEY is not set. Configure it in your environment.")
     return key
 
 
-# --- 将图像编码为 Base64 ---
 def encode_file(file_path):
     mime_type, _ = mimetypes.guess_type(file_path)
     if not mime_type or not mime_type.startswith("image/"):
-        raise ValueError("不支持或无法识别的图像格式")
+        raise ValueError(f"Unsupported image file: {file_path}")
     with open(file_path, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-    return f"data:{mime_type};base64,{encoded_string}"
+        encoded = base64.b64encode(image_file.read()).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
 
 
-# --- 下载生成结果并统一尺寸 ---
+def load_lexicon(lexicon_path=None):
+    lexicon = dict(DEFAULT_LEXICON)
+    if lexicon_path:
+        path = Path(lexicon_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Artistic-vocabulary lexicon not found: {path}")
+        with path.open("r", encoding="utf-8") as handle:
+            custom = json.load(handle)
+        if not isinstance(custom, dict):
+            raise ValueError("The artistic-vocabulary lexicon must be a JSON object.")
+        lexicon.update({str(k): str(v) for k, v in custom.items()})
+    return lexicon
+
+
+def style_map(description, lexicon):
+    """Deterministically remove or replace artistic-style descriptors."""
+    mapped = description
+    for source, target in sorted(lexicon.items(), key=lambda item: len(item[0]), reverse=True):
+        mapped = re.sub(rf"\b{re.escape(source)}\b", target, mapped, flags=re.IGNORECASE)
+    mapped = re.sub(r"\s+", " ", mapped)
+    mapped = re.sub(r"\s*([,.;:])\s*", r"\1 ", mapped)
+    return mapped.strip(" ,.;:")
+
+
+def response_text(response):
+    """Extract text from DashScope's list- or dictionary-style response."""
+    content = response.output.choices[0].message.content
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, dict):
+        return str(content.get("text", "")).strip()
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("text"):
+                texts.append(str(item["text"]))
+            elif isinstance(item, str):
+                texts.append(item)
+        return " ".join(texts).strip()
+    return str(content).strip()
+
+
+def parse_scene(image_base64, api_key, model, instruction):
+    response = MultiModalConversation.call(
+        api_key=api_key,
+        model=model,
+        messages=[{"role": "user", "content": [{"image": image_base64}, {"text": instruction}]}],
+        stream=False,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Visual semantic parsing failed: HTTP {response.status_code}; {response.message}")
+    description = response_text(response)
+    if not description:
+        raise RuntimeError("Qwen-VL-Max returned an empty scene description.")
+    return description
+
+
+def edit_image(image_base64, prompt, api_key, model):
+    response = MultiModalConversation.call(
+        api_key=api_key,
+        model=model,
+        messages=[{"role": "user", "content": [{"image": image_base64}, {"text": prompt}]}],
+        stream=False,
+        watermark=False,
+        negative_prompt=(
+            "painting, brush strokes, illustration, cartoon, sketch, oil texture, "
+            "digital art, drawing, blur, noise, distorted colors, fantasy, anime"
+        ),
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Photorealistic image editing failed: HTTP {response.status_code}; {response.message}")
+    content = response.output.choices[0].message.content
+    if not isinstance(content, list) or not content or "image" not in content[0]:
+        raise RuntimeError("Qwen-Image-Edit-Plus did not return an image URL.")
+    return content[0]["image"]
+
+
 def download_image(image_url, save_path, target_size=(512, 512)):
-    """下载图像并调整为固定大小"""
-    response = requests.get(image_url)
-    if response.status_code == 200:
-        # 临时保存
-        tmp_path = save_path + ".tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(response.content)
-
-        # 读取并调整大小
-        img = cv2.imread(tmp_path)
-        if img is not None:
-            resized = cv2.resize(img, target_size, interpolation=cv2.INTER_CUBIC)
-            cv2.imwrite(save_path, resized)
-            os.remove(tmp_path)
-            print(f"✅ 图像已保存（512×512）: {save_path}")
-            return True
-        else:
-            print(f"⚠️ 无法读取下载的图像内容: {image_url}")
-            return False
-    else:
-        print(f"❌ 图像下载失败，状态码: {response.status_code}")
-        return False
+    response = requests.get(image_url, timeout=120)
+    response.raise_for_status()
+    data = cv2.imdecode(np.frombuffer(response.content, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if data is None:
+        raise RuntimeError("Unable to decode the image returned by Qwen-Image-Edit-Plus.")
+    data = cv2.resize(data, target_size, interpolation=cv2.INTER_CUBIC)
+    if not cv2.imwrite(save_path, data):
+        raise RuntimeError(f"Unable to save proxy image: {save_path}")
 
 
-# --- 拼接原图与生成图 ---
-def create_comparison(original_path, generated_path, save_path):
-    try:
-        orig = cv2.imread(original_path)
-        gen = cv2.imread(generated_path)
-
-        if orig is None or gen is None:
-            print(f"⚠️ 无法读取拼接图像: {original_path} 或 {generated_path}")
-            return
-
-        gen = cv2.resize(gen, (orig.shape[1], orig.shape[0]))
-        comparison = cv2.hconcat([orig, gen])
-        cv2.imwrite(save_path, comparison)
-        print(f"📷 生成对比图: {save_path}")
-    except Exception as e:
-        print(f"❌ 拼接图像时出错: {str(e)}")
-
-
-def process_single_image(image_path, api_key, output_path=None, prompt=None, skip_existing=False):
-    """处理单张图片，支持 jpg/jpeg/png。"""
+def process_single_image(
+    image_path,
+    api_key,
+    output_path=None,
+    vision_language_model="qwen-vl-max",
+    image_edit_model="qwen-image-edit-plus",
+    lexicon_path=None,
+    fixed_suffix="realistic photograph",
+    parse_instruction=DEFAULT_PARSE_INSTRUCTION,
+    skip_existing=False,
+):
     if not os.path.exists(image_path):
-        raise FileNotFoundError(f"❌ 输入图像不存在: {image_path}")
-
-    image_dir = os.path.dirname(image_path)
-    image_stem = os.path.splitext(os.path.basename(image_path))[0]
-    output_path = output_path or os.path.join(image_dir, f"{image_stem}_realistic.jpg")
-    cmp_path = os.path.join(image_dir, f"{image_stem}_compare.jpg")
-
+        raise FileNotFoundError(f"Input image not found: {image_path}")
+    image_stem = Path(image_path).stem
+    output_path = output_path or str(Path(image_path).with_name(f"{image_stem}_realistic.jpg"))
     if skip_existing and os.path.exists(output_path):
-        print(f"⏭️ 已存在，跳过: {output_path}")
         return output_path
 
-    print(f"\n🎨 正在处理图像: {image_path}")
-    try:
-        image_base64 = encode_file(image_path)
+    image_base64 = encode_file(image_path)
+    description = parse_scene(image_base64, api_key, vision_language_model, parse_instruction)
+    prompt = f"{style_map(description, load_lexicon(lexicon_path))}, {fixed_suffix}".strip(", ")
+    image_url = edit_image(image_base64, prompt, api_key, image_edit_model)
+    download_image(image_url, output_path)
 
-        # === Prompt 设置 ===
-        prompt = prompt or "realistic high-resolution photograph. "
-
-        negative_prompt = (
-            "painting, brush strokes, illustration, cartoon, sketch, unreal, oil texture, low resolution, "
-            "digital art, drawing, blur, noise, fake, distorted colors, fantasy, anime"
-        )
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"image": image_base64},
-                    {"text": prompt}
-                ]
-            }
-        ]
-
-        # 调用 Dashscope API
-        response = MultiModalConversation.call(
-            api_key=api_key,
-            model="qwen-image-edit",
-            messages=messages,
-            stream=False,
-            watermark=False,
-            negative_prompt=negative_prompt
-        )
-
-        if response.status_code == 200:
-            output_url = response.output.choices[0].message.content[0]["image"]
-
-            # 下载并统一尺寸
-            if download_image(output_url, output_path, target_size=(512, 512)):
-                create_comparison(image_path, output_path, cmp_path)
-
-            return output_path
-
-        else:
-            print(f"❌ API 调用错误: HTTP {response.status_code}, 信息: {response.message}")
-            return None
-
-    except Exception as e:
-        print(f"⚠️ 处理 {image_path} 时出错: {str(e)}")
-        return None
+    # Store the deterministic intermediate prompt beside the proxy for auditing.
+    Path(output_path).with_suffix(".prompt.txt").write_text(
+        f"p_anc:\n{description}\n\np_real:\n{prompt}\n", encoding="utf-8"
+    )
+    return output_path
 
 
 def find_folder_image(folder_path):
     folder_name = os.path.basename(folder_path)
-    for ext in (".jpg", ".jpeg", ".png"):
-        image_path = os.path.join(folder_path, f"{folder_name}{ext}")
-        if os.path.exists(image_path):
-            return image_path
+    for extension in (".jpg", ".jpeg", ".png"):
+        candidate = os.path.join(folder_path, f"{folder_name}{extension}")
+        if os.path.exists(candidate):
+            return candidate
     return None
 
 
-# --- 处理单个文件夹（同名图片） ---
-def process_single_folder(folder_path, api_key, prompt=None, skip_existing=False):
-    folder_name = os.path.basename(folder_path)
-    image_path = find_folder_image(folder_path)
-
-    if not image_path:
-        expected = ", ".join(os.path.join(folder_path, f"{folder_name}{ext}") for ext in (".jpg", ".jpeg", ".png"))
-        print(f"⚠️ 跳过 {folder_name}: 未找到同名图片，期望其中之一: {expected}")
-        return None
-
-    return process_single_image(image_path, api_key, prompt=prompt, skip_existing=skip_existing)
-
-
-# --- 主控制逻辑 ---
-def process_all_samples(samples_root, api_key, prompt=None, skip_existing=True):
-    """遍历 samples 下所有子文件夹，处理同名 jpg/jpeg/png。"""
-    if not os.path.exists(samples_root):
-        print(f"❌ 路径不存在: {samples_root}")
-        return
-
-    subfolders = [os.path.join(samples_root, d) for d in os.listdir(samples_root)
-                  if os.path.isdir(os.path.join(samples_root, d)) and not d.startswith(".")]
-    if not subfolders:
-        print(f"❌ 未在 {samples_root} 下找到子文件夹。")
-        return
-
-    print(f"📁 共找到 {len(subfolders)} 个文件夹，开始批量生成...\n")
-    ok_count = 0
-    fail_count = 0
-    for folder in sorted(subfolders):
-        result = process_single_folder(folder, api_key, prompt=prompt, skip_existing=skip_existing)
-        if result:
-            ok_count += 1
-        else:
-            fail_count += 1
-
-    print(f"\n✅ 批量处理完成：成功/已存在 {ok_count}，失败/跳过 {fail_count}")
-
-
-# ==================== 主函数入口 ====================
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DashScope realistic image generation")
-    parser.add_argument("--input", type=str, default=None, help="单张输入图片路径")
-    parser.add_argument("--output", type=str, default=None, help="单张输出图片路径")
-    parser.add_argument("--samples_root", type=str, default=None, help="批量样本根目录")
-    parser.add_argument("--prompt", type=str, default=None, help="写实生成 prompt")
-    parser.add_argument("--overwrite", action="store_true", help="批量模式下覆盖已有 *_realistic.jpg")
+def main():
+    parser = argparse.ArgumentParser(description="MLLM-guided realistic semantic-proxy construction")
+    parser.add_argument("--input", type=str, default=None)
+    parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--samples_root", type=str, default=None)
+    parser.add_argument("--vision_language_model", default="qwen-vl-max")
+    parser.add_argument("--image_edit_model", default="qwen-image-edit-plus")
+    parser.add_argument("--lexicon_path", default=None)
+    parser.add_argument("--fixed_suffix", default="realistic photograph")
+    parser.add_argument("--parse_instruction", default=DEFAULT_PARSE_INSTRUCTION)
+    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
-    current_dir = os.path.dirname(os.path.abspath(__file__))  # model/realistic_generation/
-    samples_root = args.samples_root or os.path.abspath(os.path.join(current_dir, "../../sample"))
-
-    if args.input:
-        print(f"📄 单图输入: {args.input}")
-    else:
-        print(f"📂 样本根目录: {samples_root}")
-
     api_key = read_api_key()
-
+    common = dict(
+        api_key=api_key,
+        vision_language_model=args.vision_language_model,
+        image_edit_model=args.image_edit_model,
+        lexicon_path=args.lexicon_path,
+        fixed_suffix=args.fixed_suffix,
+        parse_instruction=args.parse_instruction,
+    )
     if args.input:
-        result = process_single_image(args.input, api_key, output_path=args.output, prompt=args.prompt)
-        if not result:
-            raise SystemExit(1)
-    else:
-        process_all_samples(samples_root, api_key, prompt=args.prompt, skip_existing=not args.overwrite)
+        process_single_image(args.input, output_path=args.output, skip_existing=not args.overwrite, **common)
+        return
+    if not args.samples_root:
+        parser.error("provide --input or --samples_root")
+    for folder in sorted(Path(args.samples_root).iterdir()):
+        if folder.is_dir() and not folder.name.startswith("."):
+            image_path = find_folder_image(str(folder))
+            if image_path:
+                process_single_image(image_path, skip_existing=not args.overwrite, **common)
+
+
+if __name__ == "__main__":
+    main()

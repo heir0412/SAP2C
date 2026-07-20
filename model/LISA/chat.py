@@ -23,9 +23,11 @@ def parse_args(args):
     # 输入输出路径
     parser.add_argument("--input", required=False, type=str, default=None, help="输入图像路径")
     parser.add_argument("--output", required=False, type=str, default=None, help="输出掩码路径")
+    parser.add_argument("--feature_output", required=False, type=str, default=None,
+                        help="保存 Realistic Image Stream 特征张量 (.npy)")
 
     # 模型与版本
-    parser.add_argument("--version", default="/mnt/f/survey_animate/cinemagraph/models/LISA/LISA-7B-v1")
+    parser.add_argument("--version", default="./model/LISA/LISA-13B-v1")
 
     # ✅ 自动根据输入路径选择 vis_save_path
     default_vis_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../vis_output"))
@@ -201,6 +203,12 @@ def run_inference(args, image_path, output_mask_path=None):
             default_save = os.path.join(args.vis_save_path, os.path.basename(image_path).replace('.jpg', '_mask.jpg'))
             cv2.imwrite(default_save, pred_mask_bin)
             print(f"✅ 掩码已保存: {default_save}")
+
+        if args.feature_output:
+            # The calibrated LISA probability map is retained as the
+            # realistic-domain semantic feature tensor consumed by MGB.
+            np.save(args.feature_output, prob_map.astype(np.float32)[None, ...])
+            print(f"✅ Realistic Image Stream features saved: {args.feature_output}")
 
         return output_mask_path or default_save
     else:

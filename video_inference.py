@@ -150,21 +150,28 @@ class SemanticGatedFeatureSplatting(nn.Module):
         self.thresh = consistency_thresh
 
     def get_consistency_kernel(self, sem_target, sem_warped):
-        """
-        计算语义一致性核函数 Psi
-        """
-        # 计算特征相似度 (这里简化为 Dot Product，假设语义为概率分布)
-        # sem: [B, C, H, W]
+        """Compute the semantic consistency kernel Psi(p, p'_k)."""
         similarity = torch.sum(sem_target * sem_warped, dim=1, keepdim=True)
-
-        # 指数加权：差异越大，权重 Psi 衰减越快
-        # similarity -> 1, psi -> 1
-        # similarity -> 0, psi -> small
         psi = torch.exp(self.temperature * (similarity - 1.0))
+        return torch.where(psi >= self.thresh, psi, torch.zeros_like(psi))
 
-        # 阈值截断，清除噪声
-        psi[psi < self.thresh] = 0.0
-        return psi
+    @staticmethod
+    def _sample(tensor, flow):
+        """Back-warp a tensor to the target grid for one source direction."""
+        batch, _, height, width = tensor.shape
+        yy, xx = torch.meshgrid(
+            torch.arange(height, device=tensor.device),
+            torch.arange(width, device=tensor.device),
+            indexing="ij",
+        )
+        base = torch.stack((xx, yy), dim=0).float().unsqueeze(0).expand(batch, -1, -1, -1)
+        source = base + flow
+        source[:, 0] = 2.0 * source[:, 0] / max(width - 1, 1) - 1.0
+        source[:, 1] = 2.0 * source[:, 1] / max(height - 1, 1) - 1.0
+        return F.grid_sample(
+            tensor, source.permute(0, 2, 3, 1), mode="bilinear",
+            padding_mode="border", align_corners=False,
+        )
 
     def forward(self, feature, flow, semantics):
         """
@@ -173,37 +180,20 @@ class SemanticGatedFeatureSplatting(nn.Module):
             flow:      光流场 [B, 2, H, W] (p -> p')
             semantics: 语义图 [B, S, H, W]
         Returns:
-            gated_feature: 语义修正后的特征
-            psi:           一致性掩码 (0~1)
+            Semantic-gated, bidirectionally splatted feature tensor.
         """
-        B, C, H, W = feature.shape
-
-        # 1. 构造归一化网格
-        grid_x, grid_y = torch.meshgrid(torch.arange(W), torch.arange(H), indexing='xy')
-        grid = torch.stack((grid_x, grid_y), dim=0).float().to(feature.device)  # [2, H, W]
-        grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)  # [B, 2, H, W]
-
-        # 2. 计算 p' = p + flow (注意 grid_sample 需要归一化到 -1~1)
-        # 这里的 flow 是绝对位移 (pixels)
-        vgrid = grid + flow
-        vgrid[:, 0] = 2.0 * vgrid[:, 0] / max(W - 1, 1) - 1.0
-        vgrid[:, 1] = 2.0 * vgrid[:, 1] / max(H - 1, 1) - 1.0
-        vgrid = vgrid.permute(0, 2, 3, 1)  # [B, H, W, 2]
-
-        # 3. 获取源位置的语义 F_anc(p')
-        # padding_mode='border' 假设边界外语义延续
-        sem_warped = F.grid_sample(semantics, vgrid, mode='nearest', align_corners=False, padding_mode='border')
-
-        # 4. 获取目标位置语义 F_anc(p)
-        # 在单图动画任务中，目标语义通常由原始语义决定（背景不变假设）
-        sem_target = semantics
-
-        # 5. 计算一致性核 Psi
-        psi = self.get_consistency_kernel(sem_target, sem_warped)  # [B, 1, H, W]
-
-        # 6. 返回一致性掩码
-        # 注意：这里我们主要利用 Psi 作为 Mask 在外部进行图像融合
-        return psi
+        numerator = torch.zeros_like(feature)
+        denominator = torch.zeros_like(feature[:, :1])
+        # Each direction supplies a source k with its own p'_k, semantic kernel,
+        # and splatting weight omega_k.
+        for source_flow in (flow, -flow):
+            warped_feature = self._sample(feature, source_flow)
+            warped_semantics = self._sample(semantics, source_flow)
+            psi = self.get_consistency_kernel(semantics, warped_semantics)
+            omega = torch.exp(-source_flow.norm(dim=1, keepdim=True))
+            numerator = numerator + omega * psi * warped_feature
+            denominator = denominator + omega * psi
+        return numerator / denominator.clamp_min(1e-6)
 
 
 # ------------------------------
@@ -272,7 +262,6 @@ def generate_video_single(opt, model, image_path, flow_path, n_frames=60, fps=30
         semantics = None
 
     # 4️⃣ 构造输入
-    # 模型输入保持不变，我们在输出阶段应用 Splatting Gating
     model_input = torch.cat([image, image, flow], dim=1)
 
     data = {
@@ -294,23 +283,12 @@ def generate_video_single(opt, model, image_path, flow_path, n_frames=60, fps=30
 
         raw_frame_tensor = out.data
 
-        # --- B. 应用语义门控特征喷溅 (Post-Gating) ---
+        # --- B. 语义门控特征喷溅 ---
         if use_sgfs and has_semantics and semantics is not None:
-            # 计算当前帧对应的累积光流 (假设线性运动)
-            # t=0时 flow=0, t=1时 flow=flow
             t = i / float(max(n_frames - 1, 1))
             current_flow = flow * t
-
-            # 计算一致性掩码 Psi
-            # 如果 masked_psi 接近 0，说明当前像素的光流来源语义不匹配（越界）
-            psi_mask = splatter(raw_frame_tensor, current_flow, semantics)
-
-            # 融合：由于 Psi 充当边界过滤器
-            # 语义一致区域 -> 使用生成内容 (raw_frame_tensor)
-            # 语义不一致区域 -> 强制回退到原始静态图像 (image)，防止溢出
-            final_tensor = raw_frame_tensor * psi_mask + image * (1.0 - psi_mask)
-
-            frame = util.tensor2im(final_tensor[0])
+            splatted_features = splatter(raw_frame_tensor, current_flow, semantics)
+            frame = util.tensor2im(splatted_features[0])
         else:
             frame = util.tensor2im(raw_frame_tensor[0])
 

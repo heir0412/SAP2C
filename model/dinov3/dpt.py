@@ -68,6 +68,7 @@ class DPT(nn.Module):
         self.intermediate_layer_idx = {
             'small': [2, 5, 8, 11],
             'base': [2, 5, 8, 11], 
+            'large': [2, 5, 8, 11],
         }
         
         self.encoder_size = encoder_size
@@ -78,11 +79,20 @@ class DPT(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
     
-    def forward(self, x):
+    def forward_with_features(self, x):
         patch_h, patch_w = x.shape[-2] // 16, x.shape[-1] // 16
         features = self.backbone.get_intermediate_layers(
             x, n = self.intermediate_layer_idx[self.encoder_size]
         )
         out = self.head(features, patch_h, patch_w)
         out = F.interpolate(out, (patch_h * 16, patch_w * 16), mode='bilinear', align_corners=True)
-        return out
+        # The final DINO layer is retained as the Ancient Painting Stream's
+        # structural feature tensor for cross-domain MGB fusion.
+        feature_map = features[-1].permute(0, 2, 1).reshape(
+            x.shape[0], features[-1].shape[-1], patch_h, patch_w
+        )
+        return out, feature_map
+
+    def forward(self, x):
+        logits, _ = self.forward_with_features(x)
+        return logits

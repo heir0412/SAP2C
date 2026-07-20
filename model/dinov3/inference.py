@@ -67,7 +67,7 @@ def infer_single(model, img_path, device, thr=0.5, size=(512, 512)):
     img_t = img_t.unsqueeze(0).to(device)
 
     model.eval()
-    logits = model(img_t)
+    logits, structural_features = model.forward_with_features(img_t)
     probs = torch.sigmoid(logits)
     pred_mask = (probs > thr).float()
 
@@ -78,6 +78,10 @@ def infer_single(model, img_path, device, thr=0.5, size=(512, 512)):
     base_name = os.path.splitext(os.path.basename(img_path))[0]
 
     np.save(os.path.join(base_dir, f"{base_name}_Sx.npy"), Sx)
+    np.save(
+        os.path.join(base_dir, f"{base_name}_anc_features.npy"),
+        structural_features[0].detach().cpu().numpy(),
+    )
     cv2.imwrite(os.path.join(base_dir, f"{base_name}_mask.jpg"), mask)
 
     heatmap = save_colormap(Sx, os.path.join(base_dir, f"{base_name}_Sx_heat.jpg"))
@@ -114,7 +118,7 @@ def main():
                         help="DINOv3 backbone 权重 (.pth)")
     parser.add_argument("--repo_dir", type=str, default="../../dinov3",
                         help="DINOv3 hubconf.py 所在目录")
-    parser.add_argument("--dino_size", type=str, default="s", choices=["b", "s"],
+    parser.add_argument("--dino_size", type=str, default="l", choices=["l", "b", "s"],
                         help="DINOv3 主干大小")
     parser.add_argument("--input_h", type=int, default=512)
     parser.add_argument("--input_w", type=int, default=512)
@@ -125,7 +129,9 @@ def main():
 
     # --- 加载 DINOv3 Backbone ---
     print(f"[Load DINOv3 backbone: {args.dino_size}]")
-    if args.dino_size == "b":
+    if args.dino_size == "l":
+        backbone = torch.hub.load(args.repo_dir, 'dinov3_vitl16', source='local', weights=args.dino_ckpt)
+    elif args.dino_size == "b":
         backbone = torch.hub.load(args.repo_dir, 'dinov3_vitb16', source='local', weights=args.dino_ckpt)
     else:
         backbone = torch.hub.load(args.repo_dir, 'dinov3_vits16', source='local', weights=args.dino_ckpt)
