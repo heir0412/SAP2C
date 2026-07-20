@@ -55,3 +55,12 @@ evaluate_*.py
 *.sh
 *.bash
 *.zsh
+
+# The paired dataset is deliberately versioned with Git LFS.
+!dataset/
+!dataset/train/
+!dataset/train/**
+!dataset/validation/
+!dataset/validation/**
+!dataset/test/
+!dataset/test/**
