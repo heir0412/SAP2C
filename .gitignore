@@ -1,0 +1,57 @@
+# Python and editor artifacts
+__pycache__/
+*.py[cod]
+*.so
+.idea/
+.vscode/
+.DS_Store
+._*
+.ipynb_checkpoints/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+api_key.txt
+*api_key*.txt
+*.pem
+*.key
+
+# Model weights and checkpoints
+checkpoints/
+**/checkpoints/
+**/web_pth/
+**/runs/
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+*.h5
+*.hdf5
+
+# Generated artifacts
+results/
+metrics/
+vis_output/
+samples/
+sample/
+sam/
+samp/
+**/__pycache__/
+*.log
+
+# Training and one-off scripts are intentionally not part of this repo
+scripts/
+script/
+**/train/
+**/training/
+**/*train*.py
+**/*trainer*.py
+run_*.py
+rename_*.py
+evaluate_*.py
+*.sh
+*.bash
+*.zsh

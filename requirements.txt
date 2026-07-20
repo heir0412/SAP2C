@@ -1,0 +1,19 @@
+# Common runtime dependencies for main.py and the inference entry points.
+numpy
+opencv-python
+Pillow
+PyYAML
+requests
+tqdm
+torch
+torchvision
+dashscope
+einops
+scipy
+dominate
+imageio
+imageio-ffmpeg
+
+# Some optional stages have additional dependencies documented in:
+# - model/LISA/requirements.txt
+# - model/dinov3/requirements.txt
