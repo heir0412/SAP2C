@@ -22,8 +22,8 @@ Synthesis from a Single Ancient Painting**.
 ## Demos
 
 <p align="center">
-  <img src="assets/demos/00005.gif" width="32%" alt="Demo 00005" />
   <img src="assets/demos/00001.gif" width="32%" alt="Demo 00001" />
+  <img src="assets/demos/00005.gif" width="32%" alt="Demo 00005" />
   <img src="assets/demos/00011.gif" width="32%" alt="Demo 00011" />
 </p>
 
