@@ -19,6 +19,14 @@ Synthesis from a Single Ancient Painting**.
    Splatting (SGFS) bidirectionally aggregates warped features using
    semantic-consistency kernels.
 
+## Demos
+
+![Demo 00005](assets/demos/00005.gif)
+
+![Demo 00001](assets/demos/00001.gif)
+
+![Demo 00011](assets/demos/00011.gif)
+
 ## Important files
 
 ```text
