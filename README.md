@@ -27,7 +27,7 @@ Synthesis from a Single Ancient Painting**.
   <img src="assets/demos/00011.gif" width="32%" alt="Demo 00011" />
 </p>
 
-Fig 1 : Given a single landscape image, SAP2C can generate a seamlessly looped cinemagraph at a resolution of 512 × 512. The resulting cinemagraph is provided as a video in the supplementary materials.
+Fig.1 Given a single landscape image, SAP2C can generate a seamlessly looped cinemagraph with a resolution of 512x512. The resulting cinemagraph is provided as a video in the supplementary materials.
 
 ## Important files
 
